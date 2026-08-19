@@ -11,6 +11,12 @@ goal with a single zero-input click** — no token spend, no context bloat.
 
 - **Goal auto-restore** — detects a paused/stalled goal in the desktop app and clicks `Restore Goal`
   (zero new input tokens). Model is locked to `gpt-5.6-sol`.
+- **Auto-click recovery** — automatically clicks `Restore Goal` on goal-pause / capacity error and
+  `Stop` + `Restore Goal` on a stalled turn (60s anti-repeat cooldown). Tray reminders still fire so
+  you stay informed.
+- **11 error detections with tray alerts** — capacity error, goal paused, guard stopped, desktop not
+  running, turn stalled, context >85%, bridge offline, model switched off sol, token-spend spike,
+  compaction storm, session disk bloat.
 - **Live token monitor** — animated ring + stats: current context usage / window limit / cumulative
   tokens / compaction count / guard state (polled every 3s from the session JSONL).
 - **Real-time work status** (top-right, via UI Automation): `guarding · running`, `goal paused`,

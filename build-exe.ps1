@@ -1,4 +1,6 @@
 # build-exe.ps1 — 把 5 个 ps1 内嵌进桌面 EXE 控制台(暗色主题 + 动效 + token 监控)
+# 版本号: 每次修改功能后在此递增(大版本.小版本.修订)
+$script:AppVersion = '1.2.0'
 $ErrorActionPreference = 'Stop'
 $homeDir = $env:USERPROFILE
 $desktop = [Environment]::GetFolderPath('Desktop')
@@ -23,12 +25,19 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.IO;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Windows.Forms;
 
+[assembly: AssemblyTitle("Codex Guard")]
+[assembly: AssemblyProduct("Codex Guard")]
+[assembly: AssemblyVersion("__VERSION__.0")]
+[assembly: AssemblyFileVersion("__VERSION__.0")]
+
 public class CodexWatchApp : Form {
+    internal const string APP_VERSION = "__VERSION__";
     internal const string SCRIPT_codex_desktop_drive_ps1 = "";
     internal const string SCRIPT_codex_watch_background_ps1 = "";
     internal const string SCRIPT_codex_desktop_feeder_ps1 = "";
@@ -38,6 +47,10 @@ public class CodexWatchApp : Form {
 
     [DllImport("user32.dll")] private static extern bool SetProcessDpiAwarenessContext(IntPtr value);
     [DllImport("user32.dll")] private static extern bool SetProcessDPIAware();
+    [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")] private static extern bool SetCursorPos(int X, int Y);
+    [DllImport("user32.dll")] private static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, UIntPtr dwExtraInfo);
 
     // ---- 调色板(暗色, 取自 Codex 桌面端 accent #339cff) ----
     static readonly Color BG      = Color.FromArgb(13, 15, 20);
@@ -53,6 +66,23 @@ public class CodexWatchApp : Form {
     double ringTarget = 0, ringCurrent = 0; float breathe = 0; int breatheDir = 1;
     // ---- 工作状态(右上角) ----
     string workState = "检测中"; Color workColor = Color.FromArgb(122, 130, 148);
+    // ---- 提醒(托盘气泡, 人肉接管) ----
+    NotifyIcon tray;
+    DateTime lastNotifyTime = DateTime.MinValue;
+    string lastState = "";
+    bool ctxAlerted = false;
+    long lastSessSize = -1;
+    DateTime lastSessGrowth = DateTime.UtcNow;
+    bool stallNotified = false;
+    // ---- 健康监测 ----
+    bool bridgeDown = false;
+    long prevCum = 0; int prevCompacts = -1;
+    bool modelWarned = false;
+    DateTime lastDiskCheck = DateTime.MinValue;
+    long lastDiskTotal = 0;
+    // ---- 自动点击(恢复目标/停止) ----
+    DateTime lastAutoRestore = DateTime.MinValue;
+    bool stallActed = false;
 
     // TokenPanel 用到的公开只读属性
     public double RingCurrent { get { return ringCurrent; } }
@@ -73,7 +103,7 @@ public class CodexWatchApp : Form {
     public CodexWatchApp() {
         Home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         ExtractScripts();
-        Text = "Codex 守护控制台";
+        Text = "Codex 守护控制台 v" + APP_VERSION;
         Font = new Font("Microsoft YaHei UI", 9f);
         AutoScaleMode = AutoScaleMode.Dpi;
         ClientSize = new Size(520, 440);
@@ -99,8 +129,11 @@ public class CodexWatchApp : Form {
         btnStart.Primary = true;   // 启动守护 = 主按钮(流光+渐变边框+呼吸光)
 
         animT = new Timer { Interval = 30 };  animT.Tick += (s, e) => AnimTick(); animT.Start();
-        pollT = new Timer { Interval = 3000 }; pollT.Tick += (s, e) => { PollTokens(); PollWatch(); PollWork(); };
+        pollT = new Timer { Interval = 3000 }; pollT.Tick += (s, e) => { PollTokens(); PollWatch(); PollWork(); PollHealth(); AutoAct(); };
         logT  = new Timer { Interval = 2000 }; logT.Tick += (s, e) => PollLog();
+        // 托盘图标 + 提醒
+        tray = new NotifyIcon { Icon = SystemIcons.Information, Visible = true, Text = "Codex 守护" };
+        tray.DoubleClick += (s, e) => { Show(); WindowState = FormWindowState.Normal; Activate(); };
         Shown += (s, e) => { LayoutUI(); PollTokens(); PollWatch(); PollWork(); PollLog(); pollT.Start(); logT.Start(); };
     }
     GlowButton MakeBtn(string text, int x, int y, int w) {
@@ -163,6 +196,130 @@ public class CodexWatchApp : Form {
         btnStart.Enabled = !watchRunning;
         btnStop.Enabled = watchRunning;
     }
+    // 托盘提醒(45s 冷却防刷屏) + 系统提示音
+    void Notify(string title, string msg) {
+        if ((DateTime.UtcNow - lastNotifyTime).TotalSeconds < 45) return;
+        lastNotifyTime = DateTime.UtcNow;
+        try {
+            tray.BalloonTipTitle = title; tray.BalloonTipText = msg;
+            tray.ShowBalloonTip(6000);
+            System.Media.SystemSounds.Asterisk.Play();
+        } catch { }
+    }
+    static string FormatK(long v) { return (v / 1000.0).ToString("0.0") + "K"; }
+    // 自动点击: 目标暂停/容量错误 -> 点"恢复目标"; 卡死 -> 点"停止"+"恢复目标"
+    void AutoAct() {
+        try {
+            var root = System.Windows.Automation.AutomationElement.RootElement;
+            var cond = new System.Windows.Automation.PropertyCondition(System.Windows.Automation.AutomationElement.ProcessIdProperty, 26424);
+            var win = root.FindFirst(System.Windows.Automation.TreeScope.Children, cond);
+            if (win == null) return;
+            // 1) 目标暂停 / 容量错误 -> 自动点"恢复目标"(60s 冷却, 防重复)
+            bool needRestore = workState.IndexOf("目标暂停", StringComparison.Ordinal) >= 0 ||
+                               workState.IndexOf("容量错误", StringComparison.Ordinal) >= 0;
+            if (needRestore && (DateTime.UtcNow - lastAutoRestore).TotalSeconds >= 60) {
+                lastAutoRestore = DateTime.UtcNow;
+                IntPtr hwnd = new IntPtr(win.Current.NativeWindowHandle);
+                ShowWindow(hwnd, 9); SetForegroundWindow(hwnd);
+                System.Threading.Thread.Sleep(400);
+                var all = win.FindAll(System.Windows.Automation.TreeScope.Descendants, System.Windows.Automation.Condition.TrueCondition);
+                System.Windows.Automation.AutomationElement btn = null;
+                foreach (System.Windows.Automation.AutomationElement el in all) {
+                    if (el.Current.Name == "恢复目标" && !el.Current.IsOffscreen) { btn = el; break; }
+                }
+                if (btn != null) {
+                    UiaClick(btn);
+                    Append("[自动] 已点击'恢复目标' (" + workState + ")");
+                    Notify("已自动恢复", "检测到 " + workState + "\n已自动点击'恢复目标', 请留意桌面端执行");
+                } else {
+                    Append("[自动] 需要恢复目标, 但按钮不可见");
+                }
+            }
+            // 2) 回合卡死 -> 自动点"停止" + "恢复目标"
+            if (stallNotified && !stallActed) {
+                stallActed = true;
+                IntPtr hwnd = new IntPtr(win.Current.NativeWindowHandle);
+                ShowWindow(hwnd, 9); SetForegroundWindow(hwnd);
+                System.Threading.Thread.Sleep(400);
+                var all = win.FindAll(System.Windows.Automation.TreeScope.Descendants, System.Windows.Automation.Condition.TrueCondition);
+                foreach (System.Windows.Automation.AutomationElement el in all) {
+                    if (el.Current.Name == "停止" && !el.Current.IsOffscreen) { UiaClick(el); break; }
+                }
+                System.Threading.Thread.Sleep(1500);
+                foreach (System.Windows.Automation.AutomationElement el in all) {
+                    if (el.Current.Name == "恢复目标" && !el.Current.IsOffscreen) { UiaClick(el); break; }
+                }
+                Append("[自动] 回合卡死 -> 已点'停止'并'恢复目标'");
+                Notify("已自动处理卡死", "回合 150 秒无产出\n已自动点击'停止' + '恢复目标'");
+            }
+        } catch { }
+    }
+    // UIA 点击: 优先 InvokePattern, 兜底真实鼠标点击
+    void UiaClick(System.Windows.Automation.AutomationElement el) {
+        try { ((System.Windows.Automation.InvokePattern)el.GetCurrentPattern(System.Windows.Automation.InvokePattern.Pattern)).Invoke(); return; } catch { }
+        var r = el.Current.BoundingRectangle;
+        if (r.Width <= 0 || r.Height <= 0) return;
+        int x = (int)(r.Left + r.Width / 2), y = (int)(r.Top + r.Height / 2);
+        SetCursorPos(x, y);
+        System.Threading.Thread.Sleep(120);
+        mouse_event(0x0002, 0, 0, 0, UIntPtr.Zero);   // LEFTDOWN
+        System.Threading.Thread.Sleep(60);
+        mouse_event(0x0004, 0, 0, 0, UIntPtr.Zero);   // LEFTUP
+    }
+    // 健康监测: bridge 离线 / 模型被切 / token 突增 / 压缩风暴 / 会话磁盘膨胀
+    void PollHealth() {
+        // 1) 模型桥接(bridge 8080)是否在线
+        bool up = false;
+        try {
+            var c = new System.Net.Sockets.TcpClient();
+            var t = c.ConnectAsync("127.0.0.1", 8080);
+            if (t.Wait(1500) && c.Connected) up = true;
+            c.Close();
+        } catch { }
+        if (!up && !bridgeDown) { bridgeDown = true; Notify("模型桥接离线", "127.0.0.1:8080 无响应\n请检查 super-instruct bridge 是否在运行"); }
+        else if (up) bridgeDown = false;
+        // 2) 模型必须锁定 sol(composer 模型按钮)
+        try {
+            var root = System.Windows.Automation.AutomationElement.RootElement;
+            var cond = new System.Windows.Automation.PropertyCondition(System.Windows.Automation.AutomationElement.ProcessIdProperty, 26424);
+            var win = root.FindFirst(System.Windows.Automation.TreeScope.Children, cond);
+            if (win != null) {
+                var all = win.FindAll(System.Windows.Automation.TreeScope.Descendants, System.Windows.Automation.Condition.TrueCondition);
+                string btn = "";
+                foreach (System.Windows.Automation.AutomationElement el in all) {
+                    string n = el.Current.Name; if (string.IsNullOrEmpty(n) || el.Current.IsOffscreen) continue;
+                    if (el.Current.ControlType == System.Windows.Automation.ControlType.Button && n.Length < 20 &&
+                        (n.IndexOf("Sol", StringComparison.Ordinal) >= 0 || n.IndexOf("Terra", StringComparison.Ordinal) >= 0 ||
+                         n.IndexOf("Luna", StringComparison.Ordinal) >= 0) && el.Current.BoundingRectangle.Top > 1100) { btn = n; break; }
+                }
+                if (btn.Length > 0) {
+                    if ((btn.IndexOf("Terra", StringComparison.OrdinalIgnoreCase) >= 0 || btn.IndexOf("Luna", StringComparison.OrdinalIgnoreCase) >= 0) && !modelWarned) {
+                        modelWarned = true; Notify("模型被切换", "当前模型不是 sol(" + btn + ")!\n请切回 gpt-5.6-sol");
+                    } else if (btn.IndexOf("Sol", StringComparison.Ordinal) >= 0) modelWarned = false;
+                }
+            }
+        } catch { }
+        // 3) token 消耗突增(单次轮询 3s 内 +>100 万 = 异常重试循环)
+        if (prevCum > 0 && cum - prevCum > 1000000)
+            Notify("token 消耗异常", "3 秒内累计消耗突增 " + ((cum - prevCum) / 1000000.0).ToString("0.0") + "M\n疑似重试死循环, 建议停止检查");
+        prevCum = cum;
+        // 4) 上下文压缩风暴(降智风险)
+        if (prevCompacts >= 0 && compacts > prevCompacts + 2)
+            Notify("频繁上下文压缩", "检测到上下文被反复压缩(降智风险)\n建议用 session-health 新线程重开");
+        prevCompacts = compacts;
+        // 5) 会话磁盘膨胀(>1GB, 每小时最多提醒一次)
+        if ((DateTime.UtcNow - lastDiskCheck).TotalSeconds > 120) {
+            lastDiskCheck = DateTime.UtcNow;
+            try {
+                long total = 0;
+                foreach (string f in System.IO.Directory.GetFiles(Path.Combine(Home, ".codex", "sessions"), "*.jsonl", System.IO.SearchOption.AllDirectories))
+                    total += new FileInfo(f).Length;
+                lastDiskTotal = total;
+                if (total > 1000000000L)
+                    Notify("会话文件膨胀", "sessions 目录已占 " + (total / 1048576.0).ToString("0") + " MB\n建议清理或归档旧会话");
+            } catch { }
+        }
+    }
     void PollTokens() {
         try {
             string dir = Path.Combine(Home, ".codex", "sessions");
@@ -196,6 +353,13 @@ public class CodexWatchApp : Form {
             if (limit <= 0) limit = 258000;
             ringTarget = (double)ctx / limit;
             if (ringTarget > 1) ringTarget = 1;
+            // 会话文件增长检测(回合卡死判据)
+            long sz = new FileInfo(newest).Length;
+            if (sz != lastSessSize) { lastSessSize = sz; lastSessGrowth = DateTime.UtcNow; stallNotified = false; stallActed = false; }
+            // 上下文告警: 超 85% 提醒一次, 回落 70% 后重置
+            double pct = (double)ctx / limit;
+            if (pct > 0.85 && !ctxAlerted) { ctxAlerted = true; Notify("上下文告警", string.Format("上下文已占 {0:P0}({1}/{2})\n建议: codex-session-health 新线程重开, 避免降智", pct, FormatK(ctx), FormatK(limit))); }
+            else if (pct < 0.7) ctxAlerted = false;
         } catch { }
     }
     void PollWork() {
@@ -220,6 +384,19 @@ public class CodexWatchApp : Form {
             else { s = guard + " · 空闲"; c = Color.FromArgb(122, 130, 148); }
             if (!watchRunning) c = Color.FromArgb(150, 150, 150);
             workState = s; workColor = c;
+            // 状态变化 -> 提醒用户手动操作(容量错误/目标暂停/守护停/桌面未运行)
+            if (s != lastState) {
+                lastState = s;
+                if (s.IndexOf("容量错误", StringComparison.Ordinal) >= 0) Notify("需要操作", "检测到容量错误!\n请稍后到 Codex 桌面端点击'恢复目标'重试(模型锁定 sol)");
+                else if (s.IndexOf("目标暂停", StringComparison.Ordinal) >= 0) Notify("需要操作", "目标已自动暂停!\n请到 Codex 桌面端点击'恢复目标'继续执行");
+                else if (s.IndexOf("守护停", StringComparison.Ordinal) >= 0) Notify("守护已停止", "后台守护已停止\n如需继续请点本程序'启动守护'按钮");
+                else if (s.IndexOf("桌面未运行", StringComparison.Ordinal) >= 0) Notify("桌面端未运行", "未检测到 Codex/ChatGPT 桌面窗口\n请先启动桌面端");
+            }
+            // 回合卡死提醒: 运行中但会话文件 150s 无增长
+            if (running && !stallNotified && (DateTime.UtcNow - lastSessGrowth).TotalSeconds > 150) {
+                stallNotified = true;
+                Notify("回合疑似卡死", "模型已 150 秒无任何产出\n建议到桌面端点击'停止', 再点'恢复目标'重试");
+            }
             Invalidate(new Rectangle(ClientSize.Width - 260, 12, 260, 32));
         } catch { }
     }
@@ -535,12 +712,17 @@ class TokenPanel : Panel {
 '@
 $cs = $cs -replace 'internal const string SCRIPT_[a-z_0-9]+ = "";\r?\n', ''
 $cs = $cs -replace '__B64_ENTRIES__', ($b64Lines -join "`r`n")
+$cs = $cs -replace '__VERSION__', $AppVersion
 
 $csPath = Join-Path $env:TEMP 'CodexWatchApp.cs'
 [System.IO.File]::WriteAllText($csPath, $cs, (New-Object System.Text.UTF8Encoding($true)))
 
 $outExe = Join-Path $desktop 'Codex守护.exe'
 if (Test-Path $outExe) { Remove-Item $outExe -Force -ErrorAction SilentlyContinue }   # 失败时不留旧文件误报
+# WindowsBase.dll 动态定位(在 Framework\v4.0.30319\WPF\ 下)
+$winBase = (Get-ChildItem 'C:\Windows\Microsoft.NET' -Recurse -Filter 'WindowsBase.dll' -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match 'v4\.0\.30319\\WPF' } | Select-Object -First 1).FullName
+if (-not $winBase) { throw '找不到 WindowsBase.dll' }
 $manifest = Join-Path $env:TEMP 'CodexWatchApp.manifest'
 @'
 <?xml version="1.0" encoding="utf-8"?>
@@ -554,6 +736,7 @@ $manifest = Join-Path $env:TEMP 'CodexWatchApp.manifest'
 '@ | Set-Content $manifest -Encoding ASCII
 & $csc /nologo /target:winexe /optimize /win32manifest:"$manifest" /out:"$outExe" `
   /r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll `
+  /r:"$winBase" `
   /r:C:\Windows\Microsoft.NET\Framework64\v4.0.30319\WPF\UIAutomationClient.dll `
   /r:C:\Windows\Microsoft.NET\Framework64\v4.0.30319\WPF\UIAutomationTypes.dll "$csPath" 2>&1 | ForEach-Object { Write-Host "csc: $_" }
 if (Test-Path $outExe) {
